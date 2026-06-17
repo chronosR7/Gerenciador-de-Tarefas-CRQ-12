@@ -19,13 +19,29 @@ export interface Activity {
   type: ActivityType;
   name: string;
   description: string;
-  statusId: string;
-  statusHistory: StatusChange[];
+  status_id: string;
+  statusHistory?: StatusChange[];
   suggestions?: string;
   difficulties?: string;
   suspensionReason?: string;
-  macroId?: string;
-  createdAt: string;
+  macro_id?: string | null;
+  user_id?: string;
+  activity_date?: string | null;
+  due_date?: string | null;
+  deadline?: string | null;
+  prazo?: string | null;
+  priority?: string | null;
+  prioridade?: string | null;
+  category?: string | null;
+  categoria?: string | null;
+  responsible?: string | null;
+  responsavel?: string | null;
+  processo_sei?: string | null;
+  process_sei?: string | null;
+  internal_notes?: string | null;
+  comentarios_internos?: string | null;
+  createdAt?: string;
+  created_at: string;
 }
 
 export type ViewMode = 'card' | 'table';
