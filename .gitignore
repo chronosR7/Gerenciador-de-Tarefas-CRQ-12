@@ -13,6 +13,7 @@ lerna-debug.log*
 !.env.example
 
 node_modules
+.npm-cache
 dist
 dist-ssr
 *.local

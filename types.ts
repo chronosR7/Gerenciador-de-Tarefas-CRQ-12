@@ -7,6 +7,7 @@ export interface Status {
   id: string;
   name: string;
   color: string;
+  user_id?: string;
 }
 
 export interface StatusChange {
@@ -52,6 +53,8 @@ export type ModalType =
   | { type: 'VIEW_ACTIVITY'; activity: Activity }
   | { type: 'REPORT' }
   | { type: 'MANAGE_STATUS' }
+  | { type: 'ALL_TASKS' }
+  | { type: 'DATA_MANAGEMENT' }
   | { type: 'SUSPENSION_REASON'; activity: Activity; newStatusId: string }
   | { type: 'TEXT_REPORT_DISPLAY'; reportText: string }
   | { type: 'GOOGLE_DRIVE_SYNC' }
