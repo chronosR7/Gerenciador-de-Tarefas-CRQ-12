@@ -73,6 +73,13 @@ const getInitialTheme = (): ThemeMode => {
   return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
 };
 
+const hasPasswordRecoveryInUrl = () => {
+  if (typeof window === 'undefined') return false;
+  const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+  const queryParams = new URLSearchParams(window.location.search);
+  return hashParams.get('type') === 'recovery' || queryParams.get('type') === 'recovery';
+};
+
 const formatDate = (date: Date | null) => {
   if (!date) return 'Sem prazo';
   return date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric' });
@@ -323,6 +330,7 @@ const App: React.FC = () => {
   const [filterStatus, setFilterStatus] = useState<string>('all');
   const [loading, setLoading] = useState(true);
   const [theme, setTheme] = useState<ThemeMode>(() => getInitialTheme());
+  const [isPasswordRecovery, setIsPasswordRecovery] = useState(() => hasPasswordRecoveryInUrl());
 
   const [viewMode, setViewMode] = useState<'card' | 'table'>('table');
   const [expandedMacros, setExpandedMacros] = useState<string[]>([]);
@@ -343,8 +351,12 @@ const App: React.FC = () => {
     supabase.auth.getSession().then(({ data: { session: initialSession } }) => {
       if (initialSession) {
         setSession(initialSession);
-        if (!sessionStorage.getItem('welcome_done')) setShowWelcome(true);
-        else {
+        if (hasPasswordRecoveryInUrl()) {
+          setIsPasswordRecovery(true);
+          setShowWelcome(false);
+        } else if (!sessionStorage.getItem('welcome_done')) {
+          setShowWelcome(true);
+        } else {
           setHeaderText(fullHeaderText);
           typingStarted.current = true;
         }
@@ -353,7 +365,12 @@ const App: React.FC = () => {
     });
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((event, newSession) => {
-      if (event === 'SIGNED_IN' && newSession) {
+      if (event === 'PASSWORD_RECOVERY' && newSession) {
+        setSession(newSession);
+        setIsPasswordRecovery(true);
+        setShowWelcome(false);
+        setFadeOutWelcome(false);
+      } else if (event === 'SIGNED_IN' && newSession) {
         setSession(newSession);
         if (!sessionStorage.getItem('welcome_done')) {
           setShowWelcome(true);
@@ -361,6 +378,7 @@ const App: React.FC = () => {
         }
       } else if (event === 'SIGNED_OUT') {
         setSession(null);
+        setIsPasswordRecovery(false);
         setActivities([]);
         setStatuses([]);
         sessionStorage.removeItem('welcome_done');
@@ -617,6 +635,11 @@ const App: React.FC = () => {
     supabase.auth.signOut();
   };
 
+  const finishPasswordRecovery = () => {
+    setIsPasswordRecovery(false);
+    window.history.replaceState({}, document.title, window.location.pathname);
+  };
+
   const exportToExcel = () => {
     const data = activities.map(a => ({
       'Nível': a.type,
@@ -769,6 +792,17 @@ const App: React.FC = () => {
     link.download = `Relatorio_Executivo_${new Date().toLocaleDateString('pt-BR').replace(/\//g, '-')}.doc`;
     link.click();
   };
+
+  if (isPasswordRecovery) {
+    return (
+      <Login
+        theme={theme}
+        onThemeChange={setTheme}
+        passwordRecovery
+        onPasswordRecoveryComplete={finishPasswordRecovery}
+      />
+    );
+  }
 
   if (!session) return <Login theme={theme} onThemeChange={setTheme} />;
 
