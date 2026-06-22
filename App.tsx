@@ -1,15 +1,18 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
-import { Activity, ActivityType, Status } from './types';
+import type { Session } from '@supabase/supabase-js';
+import { Activity, ActivityType, ModalType, Status } from './types';
 import { supabase } from './lib/supabaseClient';
 import Login from './Login';
-import {
-  PieChart, Pie, Cell, Tooltip, Legend, ResponsiveContainer,
-  BarChart, Bar, XAxis, YAxis
-} from 'recharts';
-import * as XLSX from 'xlsx';
 
 type ThemeMode = 'light' | 'dark';
-type DashboardActivity = Activity & Record<string, any>;
+type DashboardActivity = Activity & {
+  notes?: string | null;
+  assignee?: string | null;
+  owner?: string | null;
+  user_name?: string | null;
+  usuario?: string | null;
+  criticidade?: string | null;
+};
 type PriorityLevel = 'Crítica' | 'Alta' | 'Média' | 'Normal';
 type IconName =
   | 'alert'
@@ -51,6 +54,9 @@ interface EnrichedActivity {
 const THEME_STORAGE_KEY = 'crq-dashboard-theme';
 const CRQ_LOGO_SRC = '/crq12-logo.jpg';
 const DAY_IN_MS = 24 * 60 * 60 * 1000;
+const MAX_IMPORT_FILE_SIZE = 5 * 1024 * 1024;
+const MAX_IMPORT_ROWS = 2000;
+const ReportCharts = React.lazy(() => import('./ReportCharts'));
 
 const normalizeText = (value?: string | null) =>
   (value || '')
@@ -61,9 +67,32 @@ const normalizeText = (value?: string | null) =>
 
 const toDateOnly = (value?: string | null) => {
   if (!value) return null;
+
+  const dateOnlyMatch = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (dateOnlyMatch) {
+    const [, year, month, day] = dateOnlyMatch;
+    const localDate = new Date(Number(year), Number(month) - 1, Number(day));
+    return Number.isNaN(localDate.getTime()) ? null : localDate;
+  }
+
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return null;
   return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+};
+
+const formatInputDate = (value?: string | Date | null) => {
+  const date = value instanceof Date ? value : toDateOnly(value);
+  if (!date || Number.isNaN(date.getTime())) return '';
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
+const differenceInCalendarDays = (date: Date, reference: Date) => {
+  const dateUtc = Date.UTC(date.getFullYear(), date.getMonth(), date.getDate());
+  const referenceUtc = Date.UTC(reference.getFullYear(), reference.getMonth(), reference.getDate());
+  return Math.round((dateUtc - referenceUtc) / DAY_IN_MS);
 };
 
 const getInitialTheme = (): ThemeMode => {
@@ -113,7 +142,46 @@ const isCompletedStatus = (statusName: string) =>
   /conclu|finaliz|feito|encerrad|resolvid/.test(normalizeText(statusName));
 
 const getActivityDate = (activity: DashboardActivity) =>
-  toDateOnly(activity.due_date || activity.deadline || activity.prazo || activity.activity_date || activity.created_at);
+  toDateOnly(activity.due_date || activity.deadline || activity.prazo || activity.activity_date);
+
+const getErrorMessage = (error: unknown, fallback: string) => {
+  if (error instanceof Error && error.message) return error.message;
+  if (error && typeof error === 'object' && 'message' in error && typeof error.message === 'string') return error.message;
+  return fallback;
+};
+
+const escapeHtml = (value: unknown) => String(value ?? '')
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;')
+  .replace(/'/g, '&#039;');
+
+const parseSpreadsheetDate = (value: unknown) => {
+  if (value instanceof Date) return formatInputDate(value);
+
+  if (typeof value === 'number') {
+    const excelEpoch = new Date(1899, 11, 30);
+    const parsed = new Date(excelEpoch.getTime() + Math.round(value * DAY_IN_MS));
+    if (!Number.isNaN(parsed.getTime())) return formatInputDate(parsed);
+  }
+
+  const text = String(value ?? '').trim();
+  if (!text || normalizeText(text) === 'sem prazo') return null;
+
+  const brDate = text.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (brDate) {
+    const [, day, month, year] = brDate;
+    return formatInputDate(new Date(Number(year), Number(month) - 1, Number(day)));
+  }
+
+  return formatInputDate(text) || null;
+};
+
+const getSpreadsheetValue = (row: Record<string, unknown>, keys: string[]) => {
+  const key = keys.find(candidate => Object.prototype.hasOwnProperty.call(row, candidate));
+  return key ? row[key] : '';
+};
 
 const getResponsible = (activity: DashboardActivity) =>
   activity.responsible ||
@@ -322,13 +390,14 @@ const ActivityListItem: React.FC<{
 );
 
 const App: React.FC = () => {
-  const [session, setSession] = useState<any>(null);
+  const [session, setSession] = useState<Session | null>(null);
   const [activities, setActivities] = useState<Activity[]>([]);
   const [statuses, setStatuses] = useState<Status[]>([]);
-  const [modal, setModal] = useState<any>(null);
+  const [modal, setModal] = useState<ModalType>(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [filterStatus, setFilterStatus] = useState<string>('all');
   const [loading, setLoading] = useState(true);
+  const [dataError, setDataError] = useState('');
   const [theme, setTheme] = useState<ThemeMode>(() => getInitialTheme());
   const [isPasswordRecovery, setIsPasswordRecovery] = useState(() => hasPasswordRecoveryInUrl());
 
@@ -422,12 +491,24 @@ const App: React.FC = () => {
   const fetchData = async () => {
     if (!session?.user) return;
     setLoading(true);
+    setDataError('');
 
-    const { data: sData } = await supabase.from('statuses').select('*').order('name', { ascending: true });
-    const { data: aData } = await supabase.from('activities').select('*').order('created_at', { ascending: false });
-    if (sData) setStatuses(sData);
-    if (aData) setActivities(aData);
-    setLoading(false);
+    try {
+      const [statusResult, activityResult] = await Promise.all([
+        supabase.from('statuses').select('*').order('name', { ascending: true }),
+        supabase.from('activities').select('*').order('created_at', { ascending: false })
+      ]);
+
+      if (statusResult.error) throw statusResult.error;
+      if (activityResult.error) throw activityResult.error;
+
+      setStatuses(statusResult.data || []);
+      setActivities(activityResult.data || []);
+    } catch (error: unknown) {
+      setDataError(getErrorMessage(error, 'Não foi possível carregar tarefas e status.'));
+    } finally {
+      setLoading(false);
+    }
   };
 
   useEffect(() => {
@@ -458,7 +539,7 @@ const App: React.FC = () => {
       const dashboardActivity = activity as DashboardActivity;
       const statusName = statusMap.get(dashboardActivity.status_id)?.name || 'Sem status';
       const dueDate = getActivityDate(dashboardActivity);
-      const daysUntilDue = dueDate ? Math.round((dueDate.getTime() - todayOnly.getTime()) / DAY_IN_MS) : null;
+      const daysUntilDue = dueDate ? differenceInCalendarDays(dueDate, todayOnly) : null;
       const isCompleted = isCompletedStatus(statusName);
       const parentName = getParentName(dashboardActivity);
       const category = getCategory(dashboardActivity);
@@ -471,7 +552,7 @@ const App: React.FC = () => {
         dueDate,
         daysUntilDue,
         isCompleted,
-        isOverdue: !isCompleted && daysUntilDue !== null && daysUntilDue < 0,
+        isOverdue: !isCompleted && ((daysUntilDue !== null && daysUntilDue < 0) || /atrasad|vencid/.test(normalizeText(statusName))),
         isDueToday: !isCompleted && daysUntilDue === 0,
         priority,
         category,
@@ -527,7 +608,7 @@ const App: React.FC = () => {
 
     const importantDeadlines = sortByRisk(pending.filter(item => {
       const closeDeadline = item.daysUntilDue !== null && item.daysUntilDue <= 15;
-      const institutionalDeadline = Boolean(item.domain);
+      const institutionalDeadline = Boolean(item.domain && item.dueDate);
       return closeDeadline || institutionalDeadline;
     })).slice(0, 7);
 
@@ -586,6 +667,11 @@ const App: React.FC = () => {
     );
   }, [macroActivities, filteredActivities, searchTerm, filterStatus]);
 
+  const standaloneMicroActivities = useMemo(
+    () => filteredActivities.filter(activity => activity.type === ActivityType.MICRO && !activity.macro_id),
+    [filteredActivities]
+  );
+
   const getMicroActivities = (macroId: string) =>
     filteredActivities.filter(activity => activity.type === ActivityType.MICRO && activity.macro_id === macroId);
 
@@ -595,44 +681,103 @@ const App: React.FC = () => {
   const toggleMacro = (macroId: string) =>
     setExpandedMacros(prev => prev.includes(macroId) ? prev.filter(id => id !== macroId) : [...prev, macroId]);
 
-  const addActivity = async (activity: any) => {
-    const { error } = await supabase.from('activities').insert([{ ...activity, user_id: session.user.id }]);
-    if (error) alert('Erro: ' + error.message);
-    else {
-      setModal(null);
-      fetchData();
+  const addActivity = async (activity: Partial<Activity>) => {
+    if (!session?.user) return false;
+    const { id: _id, created_at: _createdAt, createdAt: _legacyCreatedAt, ...changes } = activity;
+    const { error } = await supabase.from('activities').insert([{
+      ...changes,
+      name: activity.name?.trim(),
+      user_id: session.user.id
+    }]);
+
+    if (error) {
+      window.alert(`Não foi possível criar o registro: ${error.message}`);
+      return false;
     }
+
+    setModal(null);
+    await fetchData();
+    return true;
   };
 
-  const updateActivity = async (activity: any) => {
-    const { error } = await supabase.from('activities').update(activity).eq('id', activity.id);
-    if (error) alert('Erro: ' + error.message);
-    else {
-      setModal(null);
-      fetchData();
+  const updateActivity = async (activity: Partial<Activity> & { id: string }) => {
+    const { id, user_id: _userId, created_at: _createdAt, createdAt: _legacyCreatedAt, ...changes } = activity;
+    const { error } = await supabase.from('activities').update(changes).eq('id', id);
+
+    if (error) {
+      window.alert(`Não foi possível atualizar o registro: ${error.message}`);
+      return false;
     }
+
+    setModal(null);
+    await fetchData();
+    return true;
   };
 
   const deleteActivity = async (activityId: string) => {
-    if (!window.confirm('Excluir?')) return;
+    const activity = activities.find(item => item.id === activityId);
+    const childCount = activities.filter(item => item.macro_id === activityId).length;
+    if (childCount > 0) {
+      window.alert(`Este projeto possui ${childCount} tarefa(s) vinculada(s). Remova ou transfira essas tarefas antes de excluir o projeto.`);
+      return;
+    }
 
-    await supabase.from('activities').delete().eq('id', activityId);
-    fetchData();
+    if (!window.confirm(`Excluir permanentemente “${activity?.name || 'este registro'}”?`)) return;
+
+    const { error } = await supabase.from('activities').delete().eq('id', activityId);
+    if (error) {
+      window.alert(`Não foi possível excluir o registro: ${error.message}`);
+      return;
+    }
+
     setModal(null);
+    await fetchData();
   };
 
   const addStatus = async (name: string, color: string) => {
-    await supabase.from('statuses').insert([{ name, color, user_id: session.user.id }]);
-    fetchData();
+    const normalizedName = name.trim();
+    if (!normalizedName || !session?.user) return false;
+    if (statuses.some(status => normalizeText(status.name) === normalizeText(normalizedName))) {
+      window.alert('Já existe um status com esse nome.');
+      return false;
+    }
+
+    const { error } = await supabase.from('statuses').insert([{ name: normalizedName, color, user_id: session.user.id }]);
+    if (error) {
+      window.alert(`Não foi possível criar o status: ${error.message}`);
+      return false;
+    }
+
+    await fetchData();
+    return true;
   };
 
   const deleteStatus = async (statusId: string) => {
-    await supabase.from('statuses').delete().eq('id', statusId);
-    fetchData();
+    const status = statuses.find(item => item.id === statusId);
+    const usageCount = activities.filter(activity => activity.status_id === statusId).length;
+    if (usageCount > 0) {
+      window.alert(`O status “${status?.name || ''}” está em uso por ${usageCount} registro(s) e não pode ser removido.`);
+      return false;
+    }
+    if (statuses.length <= 1) {
+      window.alert('Mantenha pelo menos um status cadastrado.');
+      return false;
+    }
+    if (!window.confirm(`Remover o status “${status?.name || ''}”?`)) return false;
+
+    const { error } = await supabase.from('statuses').delete().eq('id', statusId);
+    if (error) {
+      window.alert(`Não foi possível remover o status: ${error.message}`);
+      return false;
+    }
+
+    await fetchData();
+    return true;
   };
 
-  const signOut = () => {
-    supabase.auth.signOut();
+  const signOut = async () => {
+    const { error } = await supabase.auth.signOut();
+    if (error) window.alert(`Não foi possível encerrar a sessão: ${error.message}`);
   };
 
   const finishPasswordRecovery = () => {
@@ -640,13 +785,14 @@ const App: React.FC = () => {
     window.history.replaceState({}, document.title, window.location.pathname);
   };
 
-  const exportToExcel = () => {
+  const exportToExcel = async () => {
+    const XLSX = await import('xlsx');
     const data = activities.map(a => ({
       'Nível': a.type,
       'Nome': a.name,
       'Pai': activities.find(p => p.id === a.macro_id)?.name || '',
       'Status': statusMap.get(a.status_id)?.name || 'N/A',
-      'Data': new Date(a.activity_date || a.created_at).toLocaleDateString('pt-BR'),
+      'Data': formatDate(getActivityDate(a as DashboardActivity)),
       'Descrição': a.description || '',
       'Dificuldades': a.difficulties || '',
       'Processo SEI': getProcessoSei(a as DashboardActivity),
@@ -656,10 +802,11 @@ const App: React.FC = () => {
     const ws = XLSX.utils.json_to_sheet(data);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Database');
-    XLSX.writeFile(wb, 'Backup_Workspace_2026.xlsx');
+    XLSX.writeFile(wb, `Backup_Workspace_${new Date().getFullYear()}.xlsx`);
   };
 
-  const downloadTemplate = () => {
+  const downloadTemplate = async () => {
+    const XLSX = await import('xlsx');
     const templateData = [{
       'Nível': 'MACRO',
       'Nome da Atividade': 'Projeto X',
@@ -679,57 +826,147 @@ const App: React.FC = () => {
   };
 
   const handleImportData = async (file: File) => {
-    if (!file) return;
+    if (!file || !session?.user) return false;
+    if (!/\.xlsx?$/i.test(file.name)) {
+      window.alert('Selecione uma planilha nos formatos .XLSX ou .XLS.');
+      return false;
+    }
+    if (file.size > MAX_IMPORT_FILE_SIZE) {
+      window.alert('A planilha excede o limite de 5 MB. Divida a carga em arquivos menores.');
+      return false;
+    }
+    if (!statuses.length) {
+      window.alert('Cadastre pelo menos um status antes de importar tarefas.');
+      return false;
+    }
+
     setLoading(true);
-    const reader = new FileReader();
-    reader.onload = async (event) => {
-      try {
-        const workbook = XLSX.read(event.target?.result, { type: 'binary' });
-        const json: any[] = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]]);
-        const rows = json.map(row => {
-          const status = statuses.find(st => st.name.toLowerCase() === row['Status']?.toLowerCase());
-          const parent = activities.find(activity =>
-            activity.name.toLowerCase() === row['Vínculo (Projeto Pai)']?.toLowerCase() &&
-            activity.type === ActivityType.MACRO
-          );
-          return {
-            name: row['Nome da Atividade'],
-            type: row['Nível']?.toUpperCase() === 'MACRO' ? ActivityType.MACRO : ActivityType.MICRO,
-            macro_id: parent?.id || null,
-            status_id: status ? status.id : (statuses[0]?.id || null),
-            user_id: session.user.id,
-            description: row['Descrição'],
-            difficulties: row['Dificuldades'],
-            processo_sei: row['Processo SEI'] || row['Processo Sei'] || row['SEI'] || '',
-            internal_notes: row['Comentários internos'] || row['Comentarios internos'] || row['Bloco de notas'] || '',
-            suggestions: row['Sugestões'],
-            activity_date: new Date().toISOString(),
-            created_at: new Date().toISOString()
-          };
-        });
-        await supabase.from('activities').insert(rows);
-        alert('Dados processados.');
-        fetchData();
-        setModal(null);
-      } catch (error: any) {
-        alert('Erro: ' + error.message);
-      } finally {
-        setLoading(false);
+    let insertedMacroIds: string[] = [];
+
+    try {
+      const XLSX = await import('xlsx');
+      const workbook = XLSX.read(await file.arrayBuffer(), { type: 'array', cellDates: true });
+      const firstSheetName = workbook.SheetNames[0];
+      const sheet = firstSheetName ? workbook.Sheets[firstSheetName] : null;
+      if (!sheet) throw new Error('A planilha não possui uma aba legível.');
+
+      const spreadsheetRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: '', raw: true });
+      if (!spreadsheetRows.length) throw new Error('A planilha não contém registros para importar.');
+      if (spreadsheetRows.length > MAX_IMPORT_ROWS) {
+        throw new Error(`A planilha possui mais de ${MAX_IMPORT_ROWS} linhas. Divida a importação em lotes menores.`);
       }
-    };
-    reader.readAsBinaryString(file);
+
+      const normalizedRows = spreadsheetRows.map((row, index) => {
+        const line = index + 2;
+        const name = String(getSpreadsheetValue(row, ['Nome da Atividade', 'Nome'])).trim();
+        if (!name) throw new Error(`Linha ${line}: o nome da atividade é obrigatório.`);
+
+        const rawLevel = normalizeText(String(getSpreadsheetValue(row, ['Nível', 'Nivel', 'Tipo'])));
+        if (rawLevel && rawLevel !== 'macro' && rawLevel !== 'micro') {
+          throw new Error(`Linha ${line}: o nível deve ser MACRO ou MICRO.`);
+        }
+        const type = rawLevel === 'macro' ? ActivityType.MACRO : ActivityType.MICRO;
+
+        const statusLabel = String(getSpreadsheetValue(row, ['Status'])).trim();
+        const status = statusLabel
+          ? statuses.find(item => normalizeText(item.name) === normalizeText(statusLabel))
+          : statuses[0];
+        if (!status) throw new Error(`Linha ${line}: o status “${statusLabel}” não está cadastrado.`);
+
+        const rawDate = getSpreadsheetValue(row, ['Data', 'Prazo']);
+        const activityDate = parseSpreadsheetDate(rawDate);
+        if (String(rawDate ?? '').trim() && normalizeText(String(rawDate)) !== 'sem prazo' && !activityDate) {
+          throw new Error(`Linha ${line}: a data informada é inválida.`);
+        }
+
+        return {
+          line,
+          parentName: String(getSpreadsheetValue(row, ['Vínculo (Projeto Pai)', 'Vinculo (Projeto Pai)', 'Pai'])).trim(),
+          payload: {
+            name,
+            type,
+            macro_id: null as string | null,
+            status_id: status.id,
+            user_id: session.user.id,
+            description: String(getSpreadsheetValue(row, ['Descrição', 'Descricao'])).trim(),
+            difficulties: String(getSpreadsheetValue(row, ['Dificuldades'])).trim(),
+            processo_sei: String(getSpreadsheetValue(row, ['Processo SEI', 'Processo Sei', 'SEI'])).trim(),
+            internal_notes: String(getSpreadsheetValue(row, ['Comentários internos', 'Comentarios internos', 'Bloco de notas'])).trim(),
+            suggestions: String(getSpreadsheetValue(row, ['Sugestões', 'Sugestoes'])).trim(),
+            activity_date: activityDate
+          }
+        };
+      });
+
+      const importedMacros = normalizedRows.filter(row => row.payload.type === ActivityType.MACRO);
+      const duplicateMacroNames = importedMacros
+        .map(row => normalizeText(row.payload.name))
+        .filter((name, index, names) => names.indexOf(name) !== index);
+      if (duplicateMacroNames.length) throw new Error('A planilha possui projetos MACRO com nomes duplicados.');
+
+      const macroByName = new Map<string, { id: string; name: string }>(
+        macroActivities.map(macro => [normalizeText(macro.name), { id: macro.id, name: macro.name }] as const)
+      );
+
+      if (importedMacros.length) {
+        const { data, error } = await supabase
+          .from('activities')
+          .insert(importedMacros.map(row => row.payload))
+          .select('id, name');
+        if (error) throw error;
+
+        insertedMacroIds = (data || []).map(item => item.id);
+        (data || []).forEach(item => macroByName.set(normalizeText(item.name), item));
+      }
+
+      const importedTasks = normalizedRows
+        .filter(row => row.payload.type === ActivityType.MICRO)
+        .map(row => {
+          const parent = row.parentName ? macroByName.get(normalizeText(row.parentName)) : null;
+          if (row.parentName && !parent) {
+            throw new Error(`Linha ${row.line}: o projeto pai “${row.parentName}” não foi encontrado.`);
+          }
+          return { ...row.payload, macro_id: parent?.id || null };
+        });
+
+      if (importedTasks.length) {
+        const { error } = await supabase.from('activities').insert(importedTasks);
+        if (error) throw error;
+      }
+
+      window.alert(`${normalizedRows.length} registro(s) importado(s) com sucesso.`);
+      setModal(null);
+      await fetchData();
+      return true;
+    } catch (error: unknown) {
+      if (insertedMacroIds.length) {
+        await supabase.from('activities').delete().in('id', insertedMacroIds);
+      }
+      window.alert(getErrorMessage(error, 'Não foi possível processar a planilha.'));
+      return false;
+    } finally {
+      setLoading(false);
+    }
   };
 
   const generateDocxReport = (start: string, end: string) => {
     let filtered = activities;
-    if (start) filtered = filtered.filter(a => new Date(a.activity_date || a.created_at) >= new Date(start));
-    if (end) filtered = filtered.filter(a => new Date(a.activity_date || a.created_at) <= new Date(end));
+    const startDate = toDateOnly(start);
+    const endDate = toDateOnly(end);
+    if (startDate) filtered = filtered.filter(activity => {
+      const activityDate = getActivityDate(activity as DashboardActivity);
+      return Boolean(activityDate && activityDate >= startDate);
+    });
+    if (endDate) filtered = filtered.filter(activity => {
+      const activityDate = getActivityDate(activity as DashboardActivity);
+      return Boolean(activityDate && activityDate <= endDate);
+    });
 
     const macros = filtered.filter(a => a.type === ActivityType.MACRO);
     const micros = filtered.filter(a => a.type === ActivityType.MICRO);
-    const concluded = micros.filter(a => (statusMap.get(a.status_id)?.name || '').toLowerCase().match(/finalizado|concluído|concluido/));
-    const ongoing = micros.filter(a => (statusMap.get(a.status_id)?.name || '').toLowerCase().includes('andamento'));
-    const meetings = micros.filter(a => a.name.toLowerCase().match(/reunião|reuniao|call|alinhamento/));
+    const concluded = micros.filter(a => isCompletedStatus(statusMap.get(a.status_id)?.name || ''));
+    const ongoing = micros.filter(a => normalizeText(statusMap.get(a.status_id)?.name).includes('andamento'));
+    const meetings = micros.filter(a => /reuniao|call|alinhamento/.test(normalizeText(a.name)));
     const blockers = filtered.filter(a => a.difficulties && a.difficulties.trim() !== '');
 
     const efficiency = Math.round((concluded.length / (micros.length || 1)) * 100);
@@ -751,7 +988,7 @@ const App: React.FC = () => {
       </style></head>
       <body><div class="WordSection1">
         <h1>Relatório de Atividades Operacionais</h1>
-        <p align="right">Período: ${start || 'Início'} a ${end || 'Hoje'}<br>Emissão: ${new Date().toLocaleDateString('pt-BR')}</p>
+        <p align="right">Período: ${startDate ? formatDate(startDate) : 'Início'} a ${endDate ? formatDate(endDate) : 'Hoje'}<br>Emissão: ${new Date().toLocaleDateString('pt-BR')}</p>
 
         <table class="kpi-table">
           <tr>
@@ -763,23 +1000,23 @@ const App: React.FC = () => {
         </table>
 
         <h2>1 - LISTA DE PROJETOS MACRO</h2>
-        <ul>${macros.length > 0 ? macros.map(m => `<li><strong>${m.name}</strong> (Status: ${statusMap.get(m.status_id)?.name})</li>`).join('') : '<li>Nenhum projeto macro registrado.</li>'}</ul>
+        <ul>${macros.length > 0 ? macros.map(m => `<li><strong>${escapeHtml(m.name)}</strong> (Status: ${escapeHtml(statusMap.get(m.status_id)?.name || 'Sem status')})</li>`).join('') : '<li>Nenhum projeto macro registrado.</li>'}</ul>
 
         <h2>2 - ATIVIDADES SEMANAIS REALIZADAS</h2>
         <h3>2.1 - Atividades Concluídas</h3>
-        <ul>${concluded.length > 0 ? concluded.map(c => `<li>${c.name}</li>`).join('') : '<li>Nenhuma atividade concluída.</li>'}</ul>
+        <ul>${concluded.length > 0 ? concluded.map(c => `<li>${escapeHtml(c.name)}</li>`).join('') : '<li>Nenhuma atividade concluída.</li>'}</ul>
 
         <h3>2.2 - Reuniões Realizadas</h3>
-        <ul>${meetings.length > 0 ? meetings.map(r => `<li>${r.name} (Status: ${statusMap.get(r.status_id)?.name})</li>`).join('') : '<li>Nenhuma reunião registrada.</li>'}</ul>
+        <ul>${meetings.length > 0 ? meetings.map(r => `<li>${escapeHtml(r.name)} (Status: ${escapeHtml(statusMap.get(r.status_id)?.name || 'Sem status')})</li>`).join('') : '<li>Nenhuma reunião registrada.</li>'}</ul>
 
         <h3>2.3 - Atividades em Andamento</h3>
-        <ul>${ongoing.length > 0 ? ongoing.map(o => `<li>${o.name}</li>`).join('') : '<li>Nenhuma atividade em trânsito.</li>'}</ul>
+        <ul>${ongoing.length > 0 ? ongoing.map(o => `<li>${escapeHtml(o.name)}</li>`).join('') : '<li>Nenhuma atividade em trânsito.</li>'}</ul>
 
         <h2>3 - OBSTÁCULOS E DESAFIOS</h2>
-        <ul>${blockers.length > 0 ? blockers.map(b => `<li><strong>${b.name}:</strong> ${b.difficulties}</li>`).join('') : '<li>Operação sem impedimentos reportados.</li>'}</ul>
+        <ul>${blockers.length > 0 ? blockers.map(b => `<li><strong>${escapeHtml(b.name)}:</strong> ${escapeHtml(b.difficulties)}</li>`).join('') : '<li>Operação sem impedimentos reportados.</li>'}</ul>
 
         <div class="ia-box">
-          <h2 style="margin-top:0">Análise da IA (ChronosR7 Intelligence)</h2>
+          <h2 style="margin-top:0">Síntese Gerencial Automática</h2>
           <p>O período analisado demonstra uma <strong>eficiência operacional de ${efficiency}%</strong>. ${strategyRatio < 15 ? 'Observa-se um foco excessivo em demandas reativas (micro), sugerindo a necessidade de maior alocação em projetos estruturais.' : 'O equilíbrio entre visão estratégica e execução de tarefas micro demonstra uma gestão saudável do portfólio.'}</p>
           <p><strong>Gargalos Identificados:</strong> ${blockers.length > 0 ? `A presença de ${blockers.length} obstáculos reportados indica a necessidade de intervenção imediata para destravar o fluxo produtivo.` : 'Não foram detectados impedimentos críticos que comprometam o cronograma.'}</p>
         </div>
@@ -790,7 +1027,10 @@ const App: React.FC = () => {
     const link = document.createElement('a');
     link.href = url;
     link.download = `Relatorio_Executivo_${new Date().toLocaleDateString('pt-BR').replace(/\//g, '-')}.doc`;
+    document.body.appendChild(link);
     link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
   };
 
   if (isPasswordRecovery) {
@@ -812,9 +1052,9 @@ const App: React.FC = () => {
     switch (modal.type) {
       case 'ADD_ACTIVITY':
       case 'EDIT_ACTIVITY':
-        return <ActivityFormModal modal={modal} onClose={closeModal} statuses={statuses} onSave={(data: any) => { modal.type === 'EDIT_ACTIVITY' ? updateActivity(data) : addActivity(data); }} macroActivities={macroActivities} />;
+        return <ActivityFormModal modal={modal} onClose={closeModal} statuses={statuses} onSave={(data) => modal.type === 'EDIT_ACTIVITY' ? updateActivity(data as Activity) : addActivity(data)} macroActivities={macroActivities} />;
       case 'VIEW_ACTIVITY':
-        return <ActivityDetailModal activity={modal.activity} onClose={closeModal} statuses={statuses} onStatusChange={(id: string, statusId: string) => { updateActivity({ ...modal.activity, status_id: statusId }); }} onDelete={() => deleteActivity(modal.activity.id)} onEdit={() => setModal({ type: 'EDIT_ACTIVITY', activity: modal.activity })} />;
+        return <ActivityDetailModal activity={modal.activity} onClose={closeModal} statuses={statuses} onStatusChange={(id, statusId) => updateActivity({ id, status_id: statusId })} onDelete={() => deleteActivity(modal.activity.id)} onEdit={() => setModal({ type: 'EDIT_ACTIVITY', activity: modal.activity })} />;
       case 'MANAGE_STATUS':
         return <ManageStatusModal onClose={closeModal} statuses={statuses} onAddStatus={addStatus} onDeleteStatus={deleteStatus} />;
       case 'ALL_TASKS':
@@ -955,6 +1195,15 @@ const App: React.FC = () => {
             )}
           </section>
 
+          {dataError && (
+            <div role="alert" className="flex flex-col gap-3 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800 sm:flex-row sm:items-center sm:justify-between dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-200">
+              <span>{dataError}</span>
+              <button type="button" onClick={fetchData} className="text-xs font-bold uppercase tracking-wide text-rose-700 hover:text-rose-950 dark:text-rose-300 dark:hover:text-white">
+                Tentar novamente
+              </button>
+            </div>
+          )}
+
           <section className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-6">
             {summaryCards.map(card => <SummaryCard key={card.title} {...card} />)}
           </section>
@@ -1077,7 +1326,7 @@ const App: React.FC = () => {
 
             <div className="p-5">
               {viewMode === 'card' ? (
-                visibleMacroActivities.length ? (
+                visibleMacroActivities.length || standaloneMicroActivities.length ? (
                   <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
                     {visibleMacroActivities.map(macro => {
                       const micros = getMicroActivities(macro.id);
@@ -1108,9 +1357,22 @@ const App: React.FC = () => {
                         </div>
                       );
                     })}
+                    {standaloneMicroActivities.map(activity => {
+                      const item = getEnrichedItem(activity.id);
+                      const status = statusMap.get(activity.status_id);
+                      return (
+                        <button key={activity.id} type="button" onClick={() => setModal({ type: 'VIEW_ACTIVITY', activity })} className="rounded-lg border border-zinc-200 bg-white p-4 text-left shadow-sm transition hover:border-sky-300 hover:bg-sky-50/40 dark:border-zinc-800 dark:bg-zinc-950/35 dark:hover:border-sky-500/40 dark:hover:bg-sky-500/5">
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0"><span className="text-[10px] font-bold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">Tarefa sem projeto</span><h3 className="mt-1 text-sm font-bold text-zinc-950 dark:text-white">{activity.name}</h3></div>
+                            <StatusBadge statusName={status?.name || 'N/A'} color={status?.color} />
+                          </div>
+                          <p className="mt-3 text-xs text-zinc-500 dark:text-zinc-400">{item ? formatDeadline(item) : 'Sem prazo'}</p>
+                        </button>
+                      );
+                    })}
                   </div>
                 ) : (
-                  <EmptyState title="Nenhum projeto encontrado" text="A busca ou o filtro atual não retornou atividades macro." />
+                  <EmptyState title="Nenhuma atividade encontrada" text="A busca ou o filtro atual não retornou projetos ou tarefas." />
                 )
               ) : (
                 <div className="custom-scrollbar overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
@@ -1159,9 +1421,22 @@ const App: React.FC = () => {
                           </React.Fragment>
                         );
                       })}
+                      {standaloneMicroActivities.map(activity => {
+                        const item = getEnrichedItem(activity.id);
+                        const status = statusMap.get(activity.status_id);
+                        return (
+                          <tr key={activity.id} className="bg-zinc-50/60 transition hover:bg-zinc-100/80 dark:bg-zinc-950/35 dark:hover:bg-zinc-800/50">
+                            <td className="px-5 py-3 text-zinc-700 dark:text-zinc-200">{activity.name}</td>
+                            <td className="px-5 py-3 text-xs font-bold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">Micro</td>
+                            <td className="px-5 py-3"><StatusBadge statusName={status?.name || 'N/A'} color={status?.color} /></td>
+                            <td className="px-5 py-3 text-sm text-zinc-600 dark:text-zinc-300">{item ? formatDeadline(item) : 'Sem prazo'}</td>
+                            <td className="px-5 py-3 text-right"><button type="button" onClick={() => setModal({ type: 'VIEW_ACTIVITY', activity })} className="rounded-md px-2 py-1 text-xs font-bold uppercase tracking-wide text-sky-700 transition hover:bg-sky-50 dark:text-sky-300 dark:hover:bg-sky-500/10">Abrir</button></td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
-                  {!visibleMacroActivities.length && (
+                  {!visibleMacroActivities.length && !standaloneMicroActivities.length && (
                     <div className="p-5">
                       <EmptyState title="Nenhum registro encontrado" text="Ajuste a busca ou o filtro de status para ampliar a consulta." />
                     </div>
@@ -1180,42 +1455,93 @@ const App: React.FC = () => {
   );
 };
 
-const Modal: React.FC<{ title: string; onClose: () => void; children: React.ReactNode; wide?: boolean }> = ({ title, onClose, children, wide = false }) => (
-  <div className="fixed inset-0 z-[110] flex items-center justify-center bg-zinc-950/70 p-4 backdrop-blur-sm">
-    <div className={`flex max-h-[90vh] w-full flex-col overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-2xl dark:border-zinc-800 dark:bg-zinc-900 ${wide ? 'max-w-6xl' : 'max-w-2xl'}`}>
+const Modal: React.FC<{ title: string; onClose: () => void; children: React.ReactNode; wide?: boolean }> = ({ title, onClose, children, wide = false }) => {
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+
+    document.body.style.overflow = 'hidden';
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [onClose]);
+
+  return (
+  <div
+    className="fixed inset-0 z-[110] flex items-center justify-center bg-zinc-950/70 p-4 backdrop-blur-sm"
+    onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}
+  >
+    <div role="dialog" aria-modal="true" aria-label={title} className={`flex max-h-[90vh] w-full flex-col overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-2xl dark:border-zinc-800 dark:bg-zinc-900 ${wide ? 'max-w-6xl' : 'max-w-2xl'}`}>
       <div className="flex flex-shrink-0 items-center justify-between border-b border-zinc-200 bg-zinc-50 px-6 py-4 dark:border-zinc-800 dark:bg-zinc-950">
         <h2 className="text-xs font-bold uppercase tracking-[0.2em] text-zinc-500 dark:text-zinc-400">{title}</h2>
-        <button onClick={onClose} className="rounded-md px-2 text-2xl font-semibold leading-none text-zinc-400 transition hover:bg-rose-50 hover:text-rose-600 dark:hover:bg-rose-500/10 dark:hover:text-rose-300">&times;</button>
+        <button type="button" onClick={onClose} aria-label="Fechar janela" title="Fechar" className="rounded-md px-2 text-2xl font-semibold leading-none text-zinc-400 transition hover:bg-rose-50 hover:text-rose-600 dark:hover:bg-rose-500/10 dark:hover:text-rose-300">&times;</button>
       </div>
       <div className="custom-scrollbar overflow-y-auto p-6 sm:p-8">{children}</div>
     </div>
   </div>
-);
+  );
+};
 
-const ActivityFormModal: React.FC<any> = ({ modal, onClose, onSave, macroActivities, statuses }) => {
-  const isEdit = modal.type === 'EDIT_ACTIVITY';
-  const [name, setName] = useState(isEdit ? modal.activity.name : '');
-  const [type, setType] = useState(isEdit ? modal.activity.type : ActivityType.MICRO);
-  const [macroId, setMacroId] = useState(isEdit ? modal.activity.macro_id : (modal.macroId || ''));
-  const [statusId, setStatusId] = useState(isEdit ? modal.activity.status_id : (statuses[0]?.id || ''));
-  const [date, setDate] = useState(isEdit ? (modal.activity.activity_date || '') : new Date().toISOString().split('T')[0]);
-  const [desc, setDesc] = useState(isEdit ? modal.activity.description : '');
-  const [diff, setDiff] = useState(isEdit ? modal.activity.difficulties : '');
-  const [sugg, setSugg] = useState(isEdit ? modal.activity.suggestions : '');
-  const [processoSei, setProcessoSei] = useState(isEdit ? getProcessoSei(modal.activity) : '');
-  const [internalNotes, setInternalNotes] = useState(isEdit ? getInternalNotes(modal.activity) : '');
+interface ActivityFormModalProps {
+  modal: { type: 'ADD_ACTIVITY'; macroId?: string } | { type: 'EDIT_ACTIVITY'; activity: Activity };
+  onClose: () => void;
+  onSave: (activity: Partial<Activity>) => Promise<boolean>;
+  macroActivities: Activity[];
+  statuses: Status[];
+}
+
+const ActivityFormModal: React.FC<ActivityFormModalProps> = ({ modal, onClose, onSave, macroActivities, statuses }) => {
+  const existingActivity = modal.type === 'EDIT_ACTIVITY' ? modal.activity : null;
+  const isEdit = Boolean(existingActivity);
+  const [name, setName] = useState(existingActivity?.name || '');
+  const [type, setType] = useState(existingActivity?.type || ActivityType.MICRO);
+  const [macroId, setMacroId] = useState(existingActivity?.macro_id || (modal.type === 'ADD_ACTIVITY' ? modal.macroId || '' : ''));
+  const [statusId, setStatusId] = useState(existingActivity?.status_id || statuses[0]?.id || '');
+  const [date, setDate] = useState(formatInputDate(existingActivity?.activity_date) || formatInputDate(new Date()));
+  const [desc, setDesc] = useState(existingActivity?.description || '');
+  const [diff, setDiff] = useState(existingActivity?.difficulties || '');
+  const [sugg, setSugg] = useState(existingActivity?.suggestions || '');
+  const [processoSei, setProcessoSei] = useState(existingActivity ? getProcessoSei(existingActivity as DashboardActivity) : '');
+  const [internalNotes, setInternalNotes] = useState(existingActivity ? getInternalNotes(existingActivity as DashboardActivity) : '');
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   const fieldClass = 'mt-1.5 w-full rounded-lg border border-zinc-200 bg-white p-3 text-sm text-zinc-900 outline-none transition focus:border-sky-400 focus:ring-2 focus:ring-sky-100 dark:border-zinc-700 dark:bg-zinc-950 dark:text-white dark:focus:ring-sky-500/20';
   const labelClass = 'mb-1 block text-[11px] font-bold uppercase tracking-wide text-zinc-500 dark:text-zinc-400';
+  const availableMacros = macroActivities.filter(macro => macro.id !== existingActivity?.id);
+
+  const handleSubmit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!statuses.length || !statusId || !name.trim() || isSubmitting) return;
+
+    setIsSubmitting(true);
+    const saved = await onSave({
+      ...(existingActivity || {}),
+      name: name.trim(),
+      type,
+      macro_id: type === ActivityType.MICRO ? (macroId || null) : null,
+      status_id: statusId,
+      activity_date: date,
+      description: desc.trim(),
+      difficulties: diff.trim(),
+      suggestions: sugg.trim(),
+      processo_sei: processoSei.trim(),
+      internal_notes: internalNotes.trim()
+    });
+    if (!saved) setIsSubmitting(false);
+  };
 
   return (
     <Modal title={isEdit ? 'Modificar item' : 'Novo registro operacional'} onClose={onClose}>
-      <form onSubmit={(event) => { event.preventDefault(); onSave({ ...modal.activity, name, type, macro_id: macroId, status_id: statusId, activity_date: date, description: desc, difficulties: diff, suggestions: sugg, processo_sei: processoSei, internal_notes: internalNotes }); }} className="space-y-5">
+      <form onSubmit={handleSubmit} className="space-y-5">
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <div><label className={labelClass}>Hierarquia</label><select className={fieldClass} value={type} onChange={event => setType(event.target.value as any)}><option value={ActivityType.MICRO}>Micro (Tarefa)</option><option value={ActivityType.MACRO}>Macro (Projeto)</option></select></div>
-          <div><label className={labelClass}>Status inicial</label><select className={fieldClass} value={statusId} onChange={event => setStatusId(event.target.value)} required>{statuses.map((status: any) => <option key={status.id} value={status.id}>{status.name}</option>)}</select></div>
+          <div><label className={labelClass}>Hierarquia</label><select className={`${fieldClass} disabled:cursor-not-allowed disabled:opacity-60`} value={type} disabled={isEdit} title={isEdit ? 'A hierarquia não pode ser alterada depois da criação' : undefined} onChange={event => { const nextType = event.target.value as ActivityType; setType(nextType); if (nextType === ActivityType.MACRO) setMacroId(''); }}><option value={ActivityType.MICRO}>Micro (Tarefa)</option><option value={ActivityType.MACRO}>Macro (Projeto)</option></select></div>
+          <div><label className={labelClass}>Status inicial</label><select className={fieldClass} value={statusId} onChange={event => setStatusId(event.target.value)} required disabled={!statuses.length}><option value="" disabled>{statuses.length ? 'Selecione o status' : 'Cadastre um status primeiro'}</option>{statuses.map(status => <option key={status.id} value={status.id}>{status.name}</option>)}</select></div>
         </div>
-        {type === ActivityType.MICRO && (<div><label className={labelClass}>Vínculo com projeto</label><select className={fieldClass} value={macroId} onChange={event => setMacroId(event.target.value)} required><option value="">Selecione o projeto pai</option>{macroActivities.map((macro: any) => <option key={macro.id} value={macro.id}>{macro.name}</option>)}</select></div>)}
+        {type === ActivityType.MICRO && (<div><label className={labelClass}>Vínculo com projeto</label><select className={fieldClass} value={macroId} onChange={event => setMacroId(event.target.value)}><option value="">Sem projeto vinculado</option>{availableMacros.map(macro => <option key={macro.id} value={macro.id}>{macro.name}</option>)}</select></div>)}
         <div><label className={labelClass}>Título</label><input className={fieldClass} value={name} onChange={event => setName(event.target.value)} required placeholder="Ex: Call de alinhamento" /></div>
         <div><label className={labelClass}>Data base / prazo</label><input type="date" className={fieldClass} value={date} onChange={event => setDate(event.target.value)} required /></div>
         <div><label className={labelClass}>Escopo operacional</label><textarea className={fieldClass} rows={2} value={desc} onChange={event => setDesc(event.target.value)} /></div>
@@ -1224,8 +1550,8 @@ const ActivityFormModal: React.FC<any> = ({ modal, onClose, onSave, macroActivit
         <div><label className={labelClass}>Entregas / resultados</label><textarea className={fieldClass} rows={2} value={sugg} onChange={event => setSugg(event.target.value)} /></div>
         <div><label className={labelClass}>Comentários internos / bloco de notas</label><textarea className={fieldClass} rows={4} value={internalNotes} onChange={event => setInternalNotes(event.target.value)} placeholder="Observações, lembretes, cobranças realizadas ou informações relevantes" /></div>
         <div className="flex justify-end gap-3 border-t border-zinc-200 pt-6 dark:border-zinc-800">
-          <button type="button" onClick={onClose} className="rounded-lg px-5 py-2 text-xs font-bold uppercase tracking-wide text-zinc-500 transition hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800">Cancelar</button>
-          <button type="submit" className="rounded-lg bg-sky-700 px-6 py-2 text-xs font-bold uppercase tracking-wide text-white shadow-sm transition hover:bg-sky-600">Salvar registro</button>
+          <button type="button" onClick={onClose} disabled={isSubmitting} className="rounded-lg px-5 py-2 text-xs font-bold uppercase tracking-wide text-zinc-500 transition hover:bg-zinc-100 disabled:opacity-50 dark:text-zinc-400 dark:hover:bg-zinc-800">Cancelar</button>
+          <button type="submit" disabled={isSubmitting || !statuses.length} className="rounded-lg bg-sky-700 px-6 py-2 text-xs font-bold uppercase tracking-wide text-white shadow-sm transition hover:bg-sky-600 disabled:cursor-not-allowed disabled:opacity-50">{isSubmitting ? 'Salvando...' : 'Salvar registro'}</button>
         </div>
       </form>
     </Modal>
@@ -1250,31 +1576,58 @@ const ProcessoSeiDisplay: React.FC<{ activity: DashboardActivity }> = ({ activit
   return <p className="break-words leading-relaxed text-zinc-700 dark:text-zinc-300">{processoSei}</p>;
 };
 
-const ActivityDetailModal: React.FC<any> = ({ activity, onClose, statuses, onStatusChange, onDelete, onEdit }) => (
+interface ActivityDetailModalProps {
+  activity: Activity;
+  onClose: () => void;
+  statuses: Status[];
+  onStatusChange: (activityId: string, statusId: string) => Promise<boolean>;
+  onDelete: () => void;
+  onEdit: () => void;
+}
+
+const ActivityDetailModal: React.FC<ActivityDetailModalProps> = ({ activity, onClose, statuses, onStatusChange, onDelete, onEdit }) => {
+  const [statusUpdating, setStatusUpdating] = useState(false);
+  const currentStatus = statuses.find(status => status.id === activity.status_id);
+  const dueDate = getActivityDate(activity as DashboardActivity);
+
+  const handleStatusChange = async (statusId: string) => {
+    if (statusId === activity.status_id || statusUpdating) return;
+    setStatusUpdating(true);
+    const updated = await onStatusChange(activity.id, statusId);
+    if (!updated) setStatusUpdating(false);
+  };
+
+  return (
   <Modal title="Detalhes da atividade" onClose={onClose}>
     <div className="space-y-6">
       <h3 className="border-b border-zinc-200 pb-4 text-2xl font-bold tracking-tight text-zinc-950 dark:border-zinc-800 dark:text-white">{activity.name}</h3>
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <div className="rounded-lg border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-800 dark:bg-zinc-950/40"><span className="block text-[10px] font-bold uppercase tracking-wide text-zinc-500">Tipo</span><strong className="mt-1 block text-sm text-zinc-900 dark:text-white">{activity.type === ActivityType.MACRO ? 'Projeto macro' : 'Tarefa micro'}</strong></div>
+        <div className="rounded-lg border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-800 dark:bg-zinc-950/40"><span className="block text-[10px] font-bold uppercase tracking-wide text-zinc-500">Prazo</span><strong className="mt-1 block text-sm text-zinc-900 dark:text-white">{formatDate(dueDate)}</strong></div>
+        <div className="rounded-lg border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-800 dark:bg-zinc-950/40"><span className="block text-[10px] font-bold uppercase tracking-wide text-zinc-500">Status atual</span><strong className="mt-1 block text-sm text-zinc-900 dark:text-white">{currentStatus?.name || 'Sem status'}</strong></div>
+      </div>
       <div className="rounded-lg border border-zinc-200 bg-zinc-50 p-5 text-sm shadow-sm dark:border-zinc-800 dark:bg-zinc-950/40">
         <div className="space-y-4">
-          <div><span className="mb-1 block text-[11px] font-bold uppercase tracking-wide text-sky-700 dark:text-sky-300">Escopo operacional</span><p className="leading-relaxed text-zinc-700 dark:text-zinc-300">{activity.description || 'Nenhum detalhe informado.'}</p></div>
-          <div><span className="mb-1 block text-[11px] font-bold uppercase tracking-wide text-indigo-700 dark:text-indigo-300">Processo SEI</span><ProcessoSeiDisplay activity={activity} /></div>
-          <div><span className="mb-1 block text-[11px] font-bold uppercase tracking-wide text-amber-700 dark:text-amber-300">Gargalos reportados</span><p className="leading-relaxed text-zinc-700 dark:text-zinc-300">{activity.difficulties || 'Sem restrições reportadas.'}</p></div>
-          <div><span className="mb-1 block text-[11px] font-bold uppercase tracking-wide text-emerald-700 dark:text-emerald-300">Entregas finais</span><p className="leading-relaxed text-zinc-700 dark:text-zinc-300">{activity.suggestions || 'Em fase de processamento.'}</p></div>
-          <div><span className="mb-1 block text-[11px] font-bold uppercase tracking-wide text-zinc-600 dark:text-zinc-300">Comentários internos / bloco de notas</span><p className="whitespace-pre-wrap leading-relaxed text-zinc-700 dark:text-zinc-300">{getInternalNotes(activity) || 'Nenhuma anotação interna registrada.'}</p></div>
+          <div><span className="mb-1 block text-[11px] font-bold uppercase tracking-wide text-sky-700 dark:text-sky-300">Escopo operacional</span><p className="whitespace-pre-wrap leading-relaxed text-zinc-700 dark:text-zinc-300">{activity.description || 'Nenhum detalhe informado.'}</p></div>
+          <div><span className="mb-1 block text-[11px] font-bold uppercase tracking-wide text-indigo-700 dark:text-indigo-300">Processo SEI</span><ProcessoSeiDisplay activity={activity as DashboardActivity} /></div>
+          <div><span className="mb-1 block text-[11px] font-bold uppercase tracking-wide text-amber-700 dark:text-amber-300">Gargalos reportados</span><p className="whitespace-pre-wrap leading-relaxed text-zinc-700 dark:text-zinc-300">{activity.difficulties || 'Sem restrições reportadas.'}</p></div>
+          <div><span className="mb-1 block text-[11px] font-bold uppercase tracking-wide text-emerald-700 dark:text-emerald-300">Entregas finais</span><p className="whitespace-pre-wrap leading-relaxed text-zinc-700 dark:text-zinc-300">{activity.suggestions || 'Em fase de processamento.'}</p></div>
+          <div><span className="mb-1 block text-[11px] font-bold uppercase tracking-wide text-zinc-600 dark:text-zinc-300">Comentários internos / bloco de notas</span><p className="whitespace-pre-wrap leading-relaxed text-zinc-700 dark:text-zinc-300">{getInternalNotes(activity as DashboardActivity) || 'Nenhuma anotação interna registrada.'}</p></div>
         </div>
       </div>
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-        {statuses.map((status: any) => (
-          <button key={status.id} onClick={() => onStatusChange(activity.id, status.id)} className={`rounded-lg border p-2 text-[11px] font-bold uppercase tracking-wide transition ${activity.status_id === status.id ? 'border-sky-400 bg-sky-50 text-sky-700 dark:bg-sky-500/10 dark:text-sky-300' : 'border-zinc-200 text-zinc-500 hover:border-zinc-400 dark:border-zinc-800 dark:text-zinc-400 dark:hover:border-zinc-600'}`}>{status.name}</button>
+        {statuses.map(status => (
+          <button type="button" key={status.id} onClick={() => handleStatusChange(status.id)} disabled={statusUpdating || activity.status_id === status.id} className={`rounded-lg border p-2 text-[11px] font-bold uppercase tracking-wide transition disabled:cursor-not-allowed ${activity.status_id === status.id ? 'border-sky-400 bg-sky-50 text-sky-700 dark:bg-sky-500/10 dark:text-sky-300' : 'border-zinc-200 text-zinc-500 hover:border-zinc-400 disabled:opacity-50 dark:border-zinc-800 dark:text-zinc-400 dark:hover:border-zinc-600'}`}>{status.name}</button>
         ))}
       </div>
       <div className="flex gap-3 border-t border-zinc-200 pt-6 dark:border-zinc-800">
-        <button onClick={onEdit} className="flex-1 rounded-lg bg-zinc-900 py-2 text-xs font-bold uppercase tracking-wide text-white transition hover:bg-zinc-700 dark:bg-zinc-700 dark:hover:bg-zinc-600">Editar</button>
-        <button onClick={onDelete} className="rounded-lg border border-rose-200 bg-rose-50 px-6 py-2 text-xs font-bold uppercase tracking-wide text-rose-700 transition hover:bg-rose-100 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-300">Remover</button>
+        <button type="button" onClick={onEdit} disabled={statusUpdating} className="flex-1 rounded-lg bg-zinc-900 py-2 text-xs font-bold uppercase tracking-wide text-white transition hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-700 dark:hover:bg-zinc-600">Editar</button>
+        <button type="button" onClick={onDelete} disabled={statusUpdating} className="rounded-lg border border-rose-200 bg-rose-50 px-6 py-2 text-xs font-bold uppercase tracking-wide text-rose-700 transition hover:bg-rose-100 disabled:opacity-50 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-300">Remover</button>
       </div>
     </div>
   </Modal>
-);
+  );
+};
 
 const AllTasksModal: React.FC<{
   onClose: () => void;
@@ -1352,7 +1705,7 @@ const AllTasksModal: React.FC<{
           </select>
           <select value={priorityFilter} onChange={event => setPriorityFilter(event.target.value)} className={`${fieldClass} pr-9`}>
             <option value="all">Prioridade</option>
-            {(['CrÃ­tica', 'Alta', 'MÃ©dia', 'Normal'] as PriorityLevel[]).map(priority => <option key={priority} value={priority}>{priority}</option>)}
+            {(['Crítica', 'Alta', 'Média', 'Normal'] as PriorityLevel[]).map(priority => <option key={priority} value={priority}>{priority}</option>)}
           </select>
           <select value={deadlineFilter} onChange={event => setDeadlineFilter(event.target.value)} className={`${fieldClass} pr-9`}>
             <option value="all">Todos prazos</option>
@@ -1419,95 +1772,139 @@ const AllTasksModal: React.FC<{
   );
 };
 
-const ManageStatusModal: React.FC<any> = ({ onClose, statuses, onAddStatus, onDeleteStatus }) => {
+interface ManageStatusModalProps {
+  onClose: () => void;
+  statuses: Status[];
+  onAddStatus: (name: string, color: string) => Promise<boolean>;
+  onDeleteStatus: (statusId: string) => Promise<boolean>;
+}
+
+const ManageStatusModal: React.FC<ManageStatusModalProps> = ({ onClose, statuses, onAddStatus, onDeleteStatus }) => {
   const [name, setName] = useState('');
   const [color, setColor] = useState('#0ea5e9');
+  const [processing, setProcessing] = useState('');
+
+  const handleAdd = async () => {
+    if (!name.trim() || processing) return;
+    setProcessing('add');
+    const added = await onAddStatus(name, color);
+    if (added) setName('');
+    setProcessing('');
+  };
+
+  const handleDelete = async (statusId: string) => {
+    if (processing) return;
+    setProcessing(statusId);
+    await onDeleteStatus(statusId);
+    setProcessing('');
+  };
+
   return (
     <Modal title="Configuração de status" onClose={onClose}>
       <div className="space-y-4">
         <div className="custom-scrollbar max-h-60 space-y-3 overflow-y-auto pr-2">
-          {statuses.map((status: any) => (
+          {statuses.map(status => (
             <div key={status.id} className="group flex items-center justify-between rounded-lg border border-zinc-200 bg-white p-3 transition dark:border-zinc-800 dark:bg-zinc-950/40">
               <div className="flex min-w-0 items-center gap-3"><div className="h-7 w-1 rounded-full" style={{ backgroundColor: status.color }} /><span className="truncate text-xs font-bold uppercase tracking-wide text-zinc-700 dark:text-zinc-200">{status.name}</span></div>
-              <button onClick={() => onDeleteStatus(status.id)} className="text-[11px] font-bold uppercase tracking-wide text-rose-600 opacity-70 transition hover:opacity-100 dark:text-rose-300">Remover</button>
+              <button type="button" onClick={() => handleDelete(status.id)} disabled={Boolean(processing)} className="text-[11px] font-bold uppercase tracking-wide text-rose-600 opacity-70 transition hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-30 dark:text-rose-300">{processing === status.id ? 'Removendo...' : 'Remover'}</button>
             </div>
           ))}
         </div>
         <div className="mt-6 flex gap-3 rounded-lg border border-zinc-200 bg-zinc-50 p-4 dark:border-zinc-800 dark:bg-zinc-950/40">
           <input className="min-w-0 flex-1 border-b border-zinc-300 bg-transparent text-sm text-zinc-900 outline-none transition focus:border-sky-500 dark:border-zinc-700 dark:text-white" placeholder="Novo status" value={name} onChange={event => setName(event.target.value)} />
           <input type="color" value={color} onChange={event => setColor(event.target.value)} className="h-10 w-10 cursor-pointer rounded border border-zinc-300 bg-transparent p-1 dark:border-zinc-700" />
-          <button onClick={() => { if (name) onAddStatus(name, color); setName(''); }} className="inline-flex h-10 w-10 items-center justify-center rounded-lg bg-sky-700 text-white transition hover:bg-sky-600"><Icon name="plus" className="h-4 w-4" /></button>
+          <button type="button" onClick={handleAdd} disabled={!name.trim() || Boolean(processing)} aria-label="Adicionar status" title="Adicionar status" className="inline-flex h-10 w-10 items-center justify-center rounded-lg bg-sky-700 text-white transition hover:bg-sky-600 disabled:cursor-not-allowed disabled:opacity-50"><Icon name="plus" className="h-4 w-4" /></button>
         </div>
       </div>
     </Modal>
   );
 };
 
-const DataManagementModal: React.FC<any> = ({ onClose, onExport, onImport, onTemplate }) => {
+interface DataManagementModalProps {
+  onClose: () => void;
+  onExport: () => void | Promise<void>;
+  onImport: (file: File) => Promise<boolean>;
+  onTemplate: () => void | Promise<void>;
+}
+
+const DataManagementModal: React.FC<DataManagementModalProps> = ({ onClose, onExport, onImport, onTemplate }) => {
   const [file, setFile] = useState<File | null>(null);
+  const [processing, setProcessing] = useState(false);
   const cardClass = 'rounded-lg border border-zinc-200 bg-white p-5 shadow-sm transition dark:border-zinc-800 dark:bg-zinc-950/40';
   const labelClass = 'mb-1 block text-[11px] font-bold uppercase tracking-wide';
+
+  const handleImport = async () => {
+    if (!file || processing) return;
+    setProcessing(true);
+    const imported = await onImport(file);
+    if (!imported) setProcessing(false);
+  };
+
   return (
     <Modal title="Gestão de dados" onClose={onClose}>
       <div className="space-y-6">
         <div className={cardClass}>
           <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
             <div><span className={`${labelClass} text-sky-700 dark:text-sky-300`}>Backup estrutural</span><h3 className="text-sm font-bold text-zinc-900 dark:text-zinc-100">Exportar base total</h3><p className="mt-1 text-xs leading-relaxed text-zinc-500 dark:text-zinc-400">Snapshot completo em formato .XLSX.</p></div>
-            <button onClick={onExport} className="inline-flex items-center justify-center gap-2 rounded-lg border border-sky-200 bg-sky-50 px-4 py-2 text-[11px] font-bold uppercase tracking-wide text-sky-700 transition hover:bg-sky-100 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-sky-300"><Icon name="database" className="h-4 w-4" /> Gerar backup</button>
+            <button type="button" onClick={onExport} className="inline-flex items-center justify-center gap-2 rounded-lg border border-sky-200 bg-sky-50 px-4 py-2 text-[11px] font-bold uppercase tracking-wide text-sky-700 transition hover:bg-sky-100 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-sky-300"><Icon name="database" className="h-4 w-4" /> Gerar backup</button>
           </div>
         </div>
         <div className={cardClass}>
           <span className={`${labelClass} text-amber-700 dark:text-amber-300`}>Importação em lote</span>
           <h3 className="text-sm font-bold text-zinc-900 dark:text-zinc-100">Processamento de planilha</h3>
-          <div className="my-4 flex items-center justify-between gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3 dark:border-amber-500/25 dark:bg-amber-500/10"><span className="text-xs text-amber-700 dark:text-amber-300">Vincule pelo nome exato do projeto pai.</span><button onClick={onTemplate} className="text-[11px] font-bold uppercase tracking-wide text-amber-700 underline underline-offset-4 transition hover:text-amber-900 dark:text-amber-300">Baixar modelo</button></div>
+          <div className="my-4 flex items-center justify-between gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3 dark:border-amber-500/25 dark:bg-amber-500/10"><span className="text-xs text-amber-700 dark:text-amber-300">Vincule pelo nome exato do projeto pai.</span><button type="button" onClick={onTemplate} className="text-[11px] font-bold uppercase tracking-wide text-amber-700 underline underline-offset-4 transition hover:text-amber-900 dark:text-amber-300">Baixar modelo</button></div>
           <label className="mb-4 flex h-24 w-full cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed border-zinc-300 bg-zinc-50 p-3 text-center transition hover:border-sky-300 dark:border-zinc-700 dark:bg-zinc-950/40 dark:hover:border-sky-500/50">
             <Icon name="file" className="mb-2 h-5 w-5 text-zinc-400" />
             <p className="w-full truncate text-[11px] font-bold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">{file ? file.name : 'Selecionar arquivo .XLSX'}</p>
-            <input type="file" accept=".xlsx" className="hidden" onChange={event => setFile(event.target.files ? event.target.files[0] : null)} />
+            <input type="file" accept=".xlsx,.xls" className="hidden" onChange={event => setFile(event.target.files ? event.target.files[0] : null)} />
           </label>
-          <button onClick={() => onImport(file)} disabled={!file} className={`w-full rounded-lg py-3 text-xs font-bold uppercase tracking-wide transition ${file ? 'bg-sky-700 text-white hover:bg-sky-600' : 'cursor-not-allowed bg-zinc-100 text-zinc-400 dark:bg-zinc-800 dark:text-zinc-500'}`}>Iniciar carga de dados</button>
+          <button type="button" onClick={handleImport} disabled={!file || processing} className={`w-full rounded-lg py-3 text-xs font-bold uppercase tracking-wide transition ${file && !processing ? 'bg-sky-700 text-white hover:bg-sky-600' : 'cursor-not-allowed bg-zinc-100 text-zinc-400 dark:bg-zinc-800 dark:text-zinc-500'}`}>{processing ? 'Processando planilha...' : 'Iniciar carga de dados'}</button>
         </div>
       </div>
     </Modal>
   );
 };
 
-const ReportModal: React.FC<any> = ({ onClose, activities, statuses, onGenerate, theme }) => {
+interface ReportModalProps {
+  onClose: () => void;
+  activities: Activity[];
+  statuses: Status[];
+  onGenerate: (start: string, end: string) => void;
+  theme: ThemeMode;
+}
+
+const ReportModal: React.FC<ReportModalProps> = ({ onClose, activities, statuses, onGenerate, theme }) => {
   const [start, setStart] = useState('');
   const [end, setEnd] = useState('');
+  const [periodError, setPeriodError] = useState('');
   const data = statuses.map((status: Status) => ({
     name: status.name,
     value: activities.filter((activity: Activity) => activity.status_id === status.id).length,
     color: status.color
-  })).filter((item: any) => item.value > 0);
-  const chartTooltip = theme === 'dark'
-    ? { backgroundColor: '#18181b', border: '1px solid #3f3f46', borderRadius: 8, color: '#f4f4f5' }
-    : { backgroundColor: '#ffffff', border: '1px solid #e4e4e7', borderRadius: 8, color: '#18181b' };
+  })).filter(item => item.value > 0);
+  const handleGenerate = () => {
+    if (start && end && start > end) {
+      setPeriodError('A data inicial não pode ser posterior à data final.');
+      return;
+    }
+    setPeriodError('');
+    onGenerate(start, end);
+  };
 
   return (
     <Modal title="Analytics executivo" onClose={onClose}>
       <div className="space-y-6">
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-          <div className="flex h-64 flex-col items-center rounded-lg border border-zinc-200 bg-zinc-50 p-4 dark:border-zinc-800 dark:bg-zinc-950/40">
-            <span className="mb-2 text-[11px] font-bold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">Distribuição proporcional</span>
-            <ResponsiveContainer width="100%" height="100%">
-              <PieChart><Pie data={data} innerRadius={45} outerRadius={62} dataKey="value" stroke="none" paddingAngle={5}>{data.map((entry: any, index: number) => <Cell key={index} fill={entry.color} />)}</Pie><Tooltip contentStyle={chartTooltip} /><Legend verticalAlign="bottom" height={36} wrapperStyle={{ fontSize: '10px', paddingTop: '15px' }} /></PieChart>
-            </ResponsiveContainer>
-          </div>
-          <div className="flex h-64 flex-col items-center rounded-lg border border-zinc-200 bg-zinc-50 p-4 dark:border-zinc-800 dark:bg-zinc-950/40">
-            <span className="mb-2 text-[11px] font-bold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">Volume por status</span>
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={data} layout="vertical" margin={{ left: -10, right: 10 }}><XAxis type="number" hide /><YAxis dataKey="name" type="category" stroke={theme === 'dark' ? '#a1a1aa' : '#71717a'} fontSize={10} width={90} /><Tooltip cursor={{ fill: 'transparent' }} contentStyle={chartTooltip} /><Bar dataKey="value" radius={[0, 4, 4, 0]}>{data.map((entry: any, index: number) => <Cell key={index} fill={entry.color} />)}</Bar></BarChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
+        <React.Suspense fallback={<div className="flex h-64 items-center justify-center rounded-lg border border-zinc-200 bg-zinc-50 text-sm text-zinc-500 dark:border-zinc-800 dark:bg-zinc-950/40 dark:text-zinc-400">Carregando gráficos...</div>}>
+          <ReportCharts data={data} theme={theme} />
+        </React.Suspense>
         <div className="space-y-4 border-t border-zinc-200 pt-6 dark:border-zinc-800">
           <p className="text-center text-[11px] font-bold uppercase tracking-[0.2em] text-zinc-500 dark:text-zinc-400">Extração executiva (.DOCX)</p>
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <input type="date" value={start} onChange={event => setStart(event.target.value)} className="w-full rounded-lg border border-zinc-200 bg-white p-2.5 text-xs text-zinc-900 outline-none transition focus:border-sky-400 focus:ring-2 focus:ring-sky-100 dark:border-zinc-700 dark:bg-zinc-950 dark:text-white dark:focus:ring-sky-500/20" />
             <input type="date" value={end} onChange={event => setEnd(event.target.value)} className="w-full rounded-lg border border-zinc-200 bg-white p-2.5 text-xs text-zinc-900 outline-none transition focus:border-sky-400 focus:ring-2 focus:ring-sky-100 dark:border-zinc-700 dark:bg-zinc-950 dark:text-white dark:focus:ring-sky-500/20" />
           </div>
-          <button onClick={() => onGenerate(start, end)} className="w-full rounded-lg bg-sky-700 py-3 text-xs font-bold uppercase tracking-wide text-white shadow-sm transition hover:bg-sky-600">Gerar ofício oficial (.DOCX)</button>
+          {periodError && <p role="alert" className="text-sm font-medium text-rose-700 dark:text-rose-300">{periodError}</p>}
+          <button type="button" onClick={handleGenerate} className="w-full rounded-lg bg-sky-700 py-3 text-xs font-bold uppercase tracking-wide text-white shadow-sm transition hover:bg-sky-600">Gerar relatório oficial (.DOC)</button>
         </div>
       </div>
     </Modal>

@@ -1,6 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 
-const env = (import.meta as any).env || {};
+const env = import.meta.env;
 
 const supabaseUrl = env.VITE_SUPABASE_URL || env.SUPABASE_URL || '';
 const supabaseAnonKey = env.VITE_SUPABASE_ANON_KEY || env.SUPABASE_ANON_KEY || '';
@@ -12,5 +12,12 @@ if (!isSupabaseConfigured) {
 
 export const supabase = createClient(
   supabaseUrl || 'https://placeholder.supabase.co',
-  supabaseAnonKey || 'placeholder-anon-key'
+  supabaseAnonKey || 'placeholder-anon-key',
+  {
+    auth: {
+      persistSession: true,
+      autoRefreshToken: true,
+      detectSessionInUrl: true
+    }
+  }
 );

@@ -1,6 +1,6 @@
 {
-  "name": "Gestor de Atividades Inteligente",
-  "description": "Um aplicativo web para registrar, acompanhar e analisar atividades macro e micro com insights de IA para otimizar a produtividade.",
+  "name": "Gerenciador de Tarefas - CRQ-12",
+  "description": "Aplicativo institucional para registrar e acompanhar tarefas, projetos, prazos, processos SEI e status operacionais.",
   "requestFramePermissions": [],
   "majorCapabilities": []
 }

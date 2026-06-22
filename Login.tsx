@@ -12,6 +12,12 @@ interface LoginProps {
 
 type MessageTone = 'info' | 'success' | 'error';
 
+const getAuthErrorMessage = (error: unknown, fallback: string) => {
+  if (error instanceof Error && error.message) return error.message;
+  if (error && typeof error === 'object' && 'message' in error && typeof error.message === 'string') return error.message;
+  return fallback;
+};
+
 const ThemeIcon: React.FC<{ theme: ThemeMode }> = ({ theme }) => (
   <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
     {theme === 'dark' ? (
@@ -57,26 +63,41 @@ const Login: React.FC<LoginProps> = ({
   useEffect(() => {
     setDisplayText('');
     let i = 0;
+    let revealTimeout: ReturnType<typeof setTimeout> | undefined;
     const typingInterval = setInterval(() => {
       if (i < fullText.length) {
         setDisplayText(fullText.slice(0, i + 1));
         i++;
       } else {
         clearInterval(typingInterval);
-        setTimeout(() => setShowFields(true), 200);
+        revealTimeout = setTimeout(() => setShowFields(true), 200);
       }
     }, 80);
 
-    return () => clearInterval(typingInterval);
+    return () => {
+      clearInterval(typingInterval);
+      if (revealTimeout) clearTimeout(revealTimeout);
+    };
   }, [fullText]);
 
   const handleAuth = async (event: React.FormEvent) => {
     event.preventDefault();
     setMessage('');
     setMessageTone('info');
+    const normalizedEmail = email.trim();
 
     if (!isSupabaseConfigured) {
       setMessage('Login indisponivel: configure VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY no arquivo .env e reinicie o servidor.');
+      setMessageTone('error');
+      return;
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+      setMessage('Informe um e-mail válido.');
+      setMessageTone('error');
+      return;
+    }
+    if (isSignUp && password.length < 8) {
+      setMessage('A senha deve ter pelo menos 8 caracteres.');
       setMessageTone('error');
       return;
     }
@@ -85,16 +106,16 @@ const Login: React.FC<LoginProps> = ({
 
     try {
       if (isSignUp) {
-        const { error } = await supabase.auth.signUp({ email, password });
+        const { error } = await supabase.auth.signUp({ email: normalizedEmail, password });
         if (error) throw error;
         setMessage('Conta criada. Verifique seu email para confirmar o cadastro, se a confirmacao estiver ativa no Supabase.');
         setMessageTone('success');
       } else {
-        const { error } = await supabase.auth.signInWithPassword({ email, password });
+        const { error } = await supabase.auth.signInWithPassword({ email: normalizedEmail, password });
         if (error) throw error;
       }
-    } catch (error: any) {
-      setMessage(error.message || 'Erro na autenticacao.');
+    } catch (error: unknown) {
+      setMessage(getAuthErrorMessage(error, 'Erro na autenticação.'));
       setMessageTone('error');
     } finally {
       setLoading(false);
@@ -126,8 +147,8 @@ const Login: React.FC<LoginProps> = ({
 
       setMessage('Se o e-mail estiver cadastrado, você receberá um link para definir uma nova senha. Verifique também a caixa de spam.');
       setMessageTone('success');
-    } catch (error: any) {
-      setMessage(error.message || 'Não foi possível enviar o link de recuperação.');
+    } catch (error: unknown) {
+      setMessage(getAuthErrorMessage(error, 'Não foi possível enviar o link de recuperação.'));
       setMessageTone('error');
     } finally {
       setResetLoading(false);
@@ -160,8 +181,8 @@ const Login: React.FC<LoginProps> = ({
       setRecoveryComplete(true);
       setMessage('Senha atualizada com sucesso. Agora você pode voltar ao login.');
       setMessageTone('success');
-    } catch (error: any) {
-      setMessage(error.message || 'Não foi possível atualizar a senha. Solicite um novo link e tente novamente.');
+    } catch (error: unknown) {
+      setMessage(getAuthErrorMessage(error, 'Não foi possível atualizar a senha. Solicite um novo link e tente novamente.'));
       setMessageTone('error');
     } finally {
       setLoading(false);
@@ -170,10 +191,17 @@ const Login: React.FC<LoginProps> = ({
 
   const handleReturnToLogin = async () => {
     setLoading(true);
-    await supabase.auth.signOut();
-    window.history.replaceState({}, document.title, window.location.pathname);
-    onPasswordRecoveryComplete?.();
-    setLoading(false);
+    try {
+      const { error } = await supabase.auth.signOut();
+      if (error) throw error;
+      window.history.replaceState({}, document.title, window.location.pathname);
+      onPasswordRecoveryComplete?.();
+    } catch (error: unknown) {
+      setMessage(error instanceof Error ? error.message : 'Não foi possível voltar ao login.');
+      setMessageTone('error');
+    } finally {
+      setLoading(false);
+    }
   };
 
   const inputShellClass = theme === 'dark'
@@ -263,7 +291,7 @@ const Login: React.FC<LoginProps> = ({
                     <input
                       type="password"
                       required
-                      minLength={passwordRecovery ? 8 : undefined}
+                      minLength={passwordRecovery || isSignUp ? 8 : undefined}
                       autoComplete={passwordRecovery || isSignUp ? 'new-password' : 'current-password'}
                       className={`w-full rounded-xl bg-transparent px-5 py-4 font-medium outline-none ${inputClass}`}
                       placeholder={passwordRecovery ? 'Mínimo de 8 caracteres' : 'Senha'}
